@@ -1,27 +1,33 @@
 import os
-import torch
-from  torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset, load_from_disk
+from  torch.utils.data import Dataset
+from datasets import load_from_disk, load_dataset
+from torchvision import transforms
 
 
 
 class patch_dataset(Dataset):
-    def __init__(self, data_dir, mode ="train", transform=None):
+    def __init__(self, data_dir, mode ="train"):
         self.data_dir = data_dir
         self.mode = mode
-        self.train = self._load_data(self.data_dir, self.mode)
-        self.transform = transform
+        self.data = self._load_data(self.data_dir, self.mode)
+        if mode == "train":
+            self.transform = transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+            ])
+        else:
+            self.transform = None
 
     def __len__(self):
         return len(self.data)
 
     def _load_data(self, data_dir, mode):
         if os.path.isdir(data_dir):
-            dataset = load_from_disk("./galaxy_dataset")
-            dataset.save_to_disk("./galaxy_dataset")
+            dataset = load_from_disk(data_dir)
         else: 
-            dataset = load_from_disk("./galaxy_dataset")
-
+            dataset = load_dataset("matthieulel/galaxy10_decals")
+            dataset.save_to_disk(data_dir)
         return dataset[mode]
 
     def __getitem__(self, idx):

@@ -5,9 +5,11 @@
 
 ########### customed ###########
 galaxy_dataset
-*.txt
+*_key.txt
 *.sh
-checkpoints
+checkpoints/
+*.json
+wandb/
 ################################
 
 
