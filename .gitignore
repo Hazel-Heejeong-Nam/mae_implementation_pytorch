@@ -10,6 +10,9 @@ galaxy_dataset
 checkpoints/
 *.json
 wandb/
+logs_slurm/
+temp.txt
+.vscode/
 ################################
 
 

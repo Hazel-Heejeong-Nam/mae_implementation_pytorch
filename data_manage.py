@@ -17,7 +17,10 @@ class patch_dataset(Dataset):
                 transforms.ToTensor(),
             ])
         else:
-            self.transform = None
+            self.transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor()
+            ])
 
     def __len__(self):
         return len(self.data)
