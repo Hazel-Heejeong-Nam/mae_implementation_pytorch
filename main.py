@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from data_manage import patch_dataset
 from model.models_mae import mae_vit_base, mae_vit_large, mae_vit_huge
 from model.models_vit import vit_base_patch16, vit_large_patch16, vit_huge_patch14
-from util import build_scheduler, interpolate_pos_embed
+from util import build_scheduler, interpolate_pos_embed, checkpoint_exists
 from timm.models.layers import trunc_normal_
 
 imagenet_mean = np.array([0.485, 0.456, 0.406])
@@ -116,66 +116,19 @@ def main_worker(args):
         optimizer = torch.optim.AdamW(mae.parameters(), lr=args.pretrain_lr, weight_decay=0.05)
         steps_per_epoch = len(train_loader)
         scheduler = build_scheduler(optimizer, args, steps_per_epoch)
-
-        # resume from latest checkpoint in checkpoint_dir if present
         start_epoch = 0
         ckpt_dir = args.checkpoint_dir
-        if ckpt_dir and os.path.isdir(ckpt_dir):
+        if ckpt_dir and os.path.isdir(ckpt_dir) and not args.debug:
             ckpts = glob.glob(os.path.join(ckpt_dir, "mae_pretrain_epoch*.pth"))
             if len(ckpts) > 0:
-                latest_epoch = -1
-                latest_path = None
-                for p in ckpts:
-                    m = re.search(r"mae_pretrain_epoch(\d+)\.pth$", p)
-                    if m:
-                        e = int(m.group(1))
-                        if e > latest_epoch:
-                            latest_epoch = e
-                            latest_path = p
-                if latest_path is not None:
-                    state = torch.load(latest_path, map_location=args.device)
-                    try:
-                        mae.load_state_dict(state)
-                        start_epoch = latest_epoch
-                        # compute resumed global step and set optimizer lr accordingly
-                        resumed_steps = int(start_epoch * steps_per_epoch)
-                        total_steps = int(args.pretrain_epochs * steps_per_epoch)
-                        warmup_steps = int(args.warmup_epochs * steps_per_epoch)
-                        base_lr = args.pretrain_lr
-                        min_lr = args.min_lr
-
-                        def _lr_mul(step):
-                            if step < warmup_steps and warmup_steps > 0:
-                                return float(step) / float(max(1, warmup_steps))
-                            else:
-                                if step >= total_steps:
-                                    return float(min_lr) / float(max(1e-12, base_lr))
-                                progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-                                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress)))
-                                return (float(min_lr) / float(max(1e-12, base_lr))) + (1.0 - float(min_lr) / float(max(1e-12, base_lr))) * cosine_decay
-
-                        mul = _lr_mul(resumed_steps)
-                        for g in optimizer.param_groups:
-                            if 'lr_scale' in g:
-                                g['lr'] = base_lr * mul * g['lr_scale']
-                            else:
-                                g['lr'] = base_lr * mul
-
-                        # sync scheduler internal counter to resumed_steps
-                        try:
-                            scheduler.last_epoch = resumed_steps - 1
-                            scheduler.step()
-                        except Exception:
-                            # fallback: repeatedly step (safe but may be slower)
-                            for _ in range(resumed_steps):
-                                scheduler.step()
-
-                        print(f"Resumed from checkpoint {latest_path} (epoch {start_epoch}), set lr={optimizer.param_groups[0]['lr']}")
-                    except Exception as e:
-                        print(f"Failed to load checkpoint {latest_path}: {e}")
-                        start_epoch = 0
+                state_dict, optimizer, scheduler, start_epoch = checkpoint_exists(args, ckpts, optimizer, scheduler, steps_per_epoch)
+                mae.load_state_dict(state_dict)
+            else:
+                start_epoch = 0
         else:
             start_epoch = 0
+
+        # resume from latest checkpoint in checkpoint_dir if present
         for epoch in range(start_epoch, args.pretrain_epochs):
             print("Epoch {}/{}".format(epoch+1, args.pretrain_epochs))
             mae.train()
@@ -222,14 +175,6 @@ def main_worker(args):
                 if args.use_wandb:
                     wandb.log({"Pretrain Val Loss": val_loss, "epoch": epoch+1})    
 
-    # elif args.mode =="feature_extract":
-    #     if args.vit_model == "vit_base":
-    #         model = vit_base_patch16(num_classes=args.nb_classes,global_pool=args.global_pool)
-    #     elif args.vit_model == "vit_large":
-    #         model = vit_large_patch16(num_classes=args.nb_classes,global_pool=args.global_pool)
-    #     elif args.vit_model == "vit_huge":
-    #         model = vit_huge_patch14(num_classes=args.nb_classes,global_pool=args.global_pool)
-    #     checkpoint = torch.load(os.path.join(args.checkpoint_dir, f"mae_pretrain_epoch{args.pretrain_epochs}.pth"), map_location='cpu')
 
     # Linear Probing 
     elif args.mode == "linprobe":
