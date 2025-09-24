@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 import wandb
 import submitit
+import glob
+import re
+import math
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -25,10 +28,11 @@ def parse_args():
     # wandb, slurm
     parser.add_argument("--use_slurm", action="store_true", default=False)
     parser.add_argument("--use_wandb", action="store_true", default=True)
+    parser.add_argument("--slurm_walltime", default=9, type=int, help="Slurm walltime in hours.")
 
     # base
     parser.add_argument("--device", default="cuda:0", type=str)
-    parser.add_argument("--debug", action="store_true", default=True)
+    parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--batch_size", default=128, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
@@ -44,7 +48,7 @@ def parse_args():
 
     # pretraining parameters
     parser.add_argument("--pretrain_epochs", default=100, type=int)
-    parser.add_argument("--pretrain_lr", default=1e-3, type=float)
+    parser.add_argument("--pretrain_lr", default=1e-4, type=float)
     parser.add_argument("--pretrain_mask_ratio", default=0.75, type=float)  
     parser.add_argument("--patch_size", default=16, type=int)   
     parser.add_argument("--vit_model", default="vit_large", choices=["vit_base", "vit_large", "vit_huge"], type=str)
@@ -112,7 +116,67 @@ def main_worker(args):
         optimizer = torch.optim.AdamW(mae.parameters(), lr=args.pretrain_lr, weight_decay=0.05)
         steps_per_epoch = len(train_loader)
         scheduler = build_scheduler(optimizer, args, steps_per_epoch)
-        for epoch in range(args.pretrain_epochs):
+
+        # resume from latest checkpoint in checkpoint_dir if present
+        start_epoch = 0
+        ckpt_dir = args.checkpoint_dir
+        if ckpt_dir and os.path.isdir(ckpt_dir):
+            ckpts = glob.glob(os.path.join(ckpt_dir, "mae_pretrain_epoch*.pth"))
+            if len(ckpts) > 0:
+                latest_epoch = -1
+                latest_path = None
+                for p in ckpts:
+                    m = re.search(r"mae_pretrain_epoch(\d+)\.pth$", p)
+                    if m:
+                        e = int(m.group(1))
+                        if e > latest_epoch:
+                            latest_epoch = e
+                            latest_path = p
+                if latest_path is not None:
+                    state = torch.load(latest_path, map_location=args.device)
+                    try:
+                        mae.load_state_dict(state)
+                        start_epoch = latest_epoch
+                        # compute resumed global step and set optimizer lr accordingly
+                        resumed_steps = int(start_epoch * steps_per_epoch)
+                        total_steps = int(args.pretrain_epochs * steps_per_epoch)
+                        warmup_steps = int(args.warmup_epochs * steps_per_epoch)
+                        base_lr = args.pretrain_lr
+                        min_lr = args.min_lr
+
+                        def _lr_mul(step):
+                            if step < warmup_steps and warmup_steps > 0:
+                                return float(step) / float(max(1, warmup_steps))
+                            else:
+                                if step >= total_steps:
+                                    return float(min_lr) / float(max(1e-12, base_lr))
+                                progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * (1.0 - progress)))
+                                return (float(min_lr) / float(max(1e-12, base_lr))) + (1.0 - float(min_lr) / float(max(1e-12, base_lr))) * cosine_decay
+
+                        mul = _lr_mul(resumed_steps)
+                        for g in optimizer.param_groups:
+                            if 'lr_scale' in g:
+                                g['lr'] = base_lr * mul * g['lr_scale']
+                            else:
+                                g['lr'] = base_lr * mul
+
+                        # sync scheduler internal counter to resumed_steps
+                        try:
+                            scheduler.last_epoch = resumed_steps - 1
+                            scheduler.step()
+                        except Exception:
+                            # fallback: repeatedly step (safe but may be slower)
+                            for _ in range(resumed_steps):
+                                scheduler.step()
+
+                        print(f"Resumed from checkpoint {latest_path} (epoch {start_epoch}), set lr={optimizer.param_groups[0]['lr']}")
+                    except Exception as e:
+                        print(f"Failed to load checkpoint {latest_path}: {e}")
+                        start_epoch = 0
+        else:
+            start_epoch = 0
+        for epoch in range(start_epoch, args.pretrain_epochs):
             print("Epoch {}/{}".format(epoch+1, args.pretrain_epochs))
             mae.train()
             train_loss = 0.0
@@ -158,6 +222,15 @@ def main_worker(args):
                 if args.use_wandb:
                     wandb.log({"Pretrain Val Loss": val_loss, "epoch": epoch+1})    
 
+    # elif args.mode =="feature_extract":
+    #     if args.vit_model == "vit_base":
+    #         model = vit_base_patch16(num_classes=args.nb_classes,global_pool=args.global_pool)
+    #     elif args.vit_model == "vit_large":
+    #         model = vit_large_patch16(num_classes=args.nb_classes,global_pool=args.global_pool)
+    #     elif args.vit_model == "vit_huge":
+    #         model = vit_huge_patch14(num_classes=args.nb_classes,global_pool=args.global_pool)
+    #     checkpoint = torch.load(os.path.join(args.checkpoint_dir, f"mae_pretrain_epoch{args.pretrain_epochs}.pth"), map_location='cpu')
+
     # Linear Probing 
     elif args.mode == "linprobe":
         probing_name = f"linprobe_lr{args.linprobe_lr}_epochs{args.linprobe_epochs}"
@@ -174,13 +247,6 @@ def main_worker(args):
         checkpoint = torch.load(os.path.join(args.checkpoint_dir, f"mae_pretrain_epoch{args.pretrain_epochs}.pth"), map_location='cpu')
 
         print("Load pre-trained checkpoint from: %s" % os.path.join(args.checkpoint_dir, f"mae_pretrain_epoch{args.pretrain_epochs}.pth"))
-        # state_dict = model.state_dict()
-        # for k in ['head.weight', 'head.bias']:
-        #     if k in checkpoint and checkpoint[k].shape != state_dict[k].shape:
-        #         print(f"Removing key {k} from pretrained checkpoint")
-        #         del checkpoint[k]
-
-        # interpolate position embedding
         interpolate_pos_embed(model, checkpoint)
 
         # load pre-trained model
@@ -298,7 +364,7 @@ if __name__ =="__main__":
             gpus_per_node=1,
             cpus_per_task=args.num_workers + 2,
             nodes=1,
-            timeout_min=540,
+            timeout_min=args.slurm_walltime * 60,  
             slurm_partition="gpu",
             slurm_signal_delay_s=120,
         )
