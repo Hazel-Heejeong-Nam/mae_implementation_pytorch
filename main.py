@@ -3,20 +3,16 @@ import os
 
 import numpy as np
 import torch
-import torch.nn as nn
 import wandb
 import submitit
 import glob
-import re
-import math
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from timm.models.layers import trunc_normal_
 
 from data_manage import patch_dataset
 from model.models_mae import mae_vit_base, mae_vit_large, mae_vit_huge
 from model.models_vit import vit_base_patch16, vit_large_patch16, vit_huge_patch14
 from util import build_scheduler, interpolate_pos_embed, checkpoint_exists
-from timm.models.layers import trunc_normal_
+from train import train_one_epoch_pretrain, train_one_epoch_linprobe
 
 imagenet_mean = np.array([0.485, 0.456, 0.406])
 imagenet_std = np.array([0.229, 0.224, 0.225])
@@ -100,7 +96,7 @@ def main_worker(args):
     )
 
     if args.mode == "pretrain":
-        wandb.init(project="mae_galaxy", config=vars(args), name=fname)
+        wandb.init(project="mae_galaxy_v2", config=vars(args), name=fname)
         print("Pretraining mode")
         if args.vit_model == "vit_base":
             mae = mae_vit_base()
@@ -131,55 +127,13 @@ def main_worker(args):
         # resume from latest checkpoint in checkpoint_dir if present
         for epoch in range(start_epoch, args.pretrain_epochs):
             print("Epoch {}/{}".format(epoch+1, args.pretrain_epochs))
-            mae.train()
-            train_loss = 0.0
-            for images, _ in tqdm(train_loader):
-                images = images.to(args.device)
-
-                loss, pred, mask = mae(images, mask_ratio=args.pretrain_mask_ratio)
-                # pred shape bs, 196 (num masked patch), 768 (768 = 16*16*3)
-                # mask shape bs, 196
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                # step scheduler once per optimizer step
-                scheduler.step()
-
-                train_loss += loss.item() * images.size(0)
-
-            train_loss /= len(train_loader.dataset)
-            print(f"Epoch [{epoch+1}/{args.pretrain_epochs}], Train Loss: {train_loss:.4f}")
-
-            if args.use_wandb:
-                wandb.log({"Pretrain Train Loss": train_loss, "epoch": epoch+1, "lr": optimizer.param_groups[0]['lr']})
-
-            # Save checkpoint
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == args.pretrain_epochs:
-                checkpoint_path = os.path.join(args.checkpoint_dir, f"mae_pretrain_epoch{epoch+1}.pth")
-                torch.save(mae.state_dict(), checkpoint_path)
-                print(f"Checkpoint saved at {checkpoint_path}")
-
-            # Validation
-            if (epoch + 1) % args.validation_epochs == 0 or (epoch + 1) == args.pretrain_epochs:
-                mae.eval()
-                val_loss = 0.0
-                with torch.no_grad():
-                    for images, _ in tqdm(val_loader):
-                        images = images.to(args.device)
-                        loss, pred, mask = mae(images, mask_ratio=args.pretrain_mask_ratio)
-                        val_loss += loss.item() * images.size(0)
-
-                val_loss /= len(val_loader.dataset)
-                print(f"Epoch [{epoch+1}/{args.pretrain_epochs}], Val Loss: {val_loss:.4f}")
-
-                if args.use_wandb:
-                    wandb.log({"Pretrain Val Loss": val_loss, "epoch": epoch+1})    
+            mae, optimizer, scheduler = train_one_epoch_pretrain(args, mae, optimizer, scheduler, train_loader, val_loader, epoch, fname)
 
 
     # Linear Probing 
     elif args.mode == "linprobe":
         probing_name = f"linprobe_lr{args.linprobe_lr}_epochs{args.linprobe_epochs}"
-        wandb.init(project="linprobe_galaxy", config=vars(args), name=fname+probing_name)
+        wandb.init(project="linprobe_galaxy_v2", config=vars(args), name=fname+probing_name)
 
         print("Linear Probing mode")
         if args.vit_model == "vit_base":
@@ -222,63 +176,8 @@ def main_worker(args):
     
         for epoch in range(args.linprobe_epochs):
             print("Epoch {}/{}".format(epoch+1, args.linprobe_epochs))
-            model.train()
-            train_loss = 0.0
-            correct = 0
-            total = 0
-            for images, labels in tqdm(train_loader):
-                images = images.to(args.device)
-                labels = labels.to(args.device)
-
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                # step scheduler once per optimizer step
-                scheduler.step()
-
-                train_loss += loss.item() * images.size(0)
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-
-            train_loss /= len(train_loader.dataset)
-            train_acc = 100.*correct/total
-            print(f"Epoch [{epoch+1}/{args.linprobe_epochs}], Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-
-            if args.use_wandb:
-                wandb.log({"Linprobe Train Loss": train_loss, "Linprobe Train Acc": train_acc, "epoch": epoch+1, "lr": optimizer.param_groups[0]['lr']})
-
-            # Save checkpoint
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == args.linprobe_epochs:
-                lin_checkpoint_path = os.path.join(args.checkpoint_dir, probing_name)
-                os.makedirs(lin_checkpoint_path, exist_ok=True)
-                torch.save(model.state_dict(), lin_checkpoint_path+f"/linprobe_epoch{epoch+1}.pth")
-                print(f"Probing checkpoint saved at {lin_checkpoint_path}")
-
-            # Validation
-            model.eval()
-            val_loss = 0.0
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for images, labels in tqdm(val_loader):
-                    images = images.to(args.device)
-                    labels = labels.to(args.device)
-
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-
-                    val_loss += loss.item() * images.size(0)
-                    _, predicted = outputs.max(1)
-                    total += labels.size(0)
-                    correct += predicted.eq(labels).sum().item()
-
-            val_loss /= len(val_loader.dataset)
-            val_acc = 100.*correct/total
-            print(f"Epoch [{epoch+1}/{args.linprobe_epochs}], Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}%")
+            model, optimizer, scheduler = train_one_epoch_linprobe(args, model, criterion, optimizer, scheduler, train_loader, val_loader, epoch, probing_name)
+        
 
 
 if __name__ =="__main__":
